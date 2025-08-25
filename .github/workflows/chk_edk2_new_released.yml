@@ -1,0 +1,233 @@
+name: Update EDK2 on Release and Create Tag & Release
+
+on:
+  schedule:
+    # 每天检查一次是否有新Release（UTC时间午夜）
+    - cron: '0 0 * * *'
+  workflow_dispatch: # 允许手动触发
+
+jobs:
+  check-release:
+    runs-on: ubuntu-latest
+    outputs:
+      has_new_release: ${{ steps.check_release.outputs.has_new_release }}
+      latest_tag: ${{ steps.check_release.outputs.latest_tag }}
+      latest_sha: ${{ steps.check_release.outputs.latest_sha }}
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+        token: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Check for new EDK2 releases
+      id: check_release
+      uses: actions/github-script@v6
+      with:
+        script: |
+          try {
+            // 获取tianocore/edk2的最新release
+            const { data: latestRelease } = await github.rest.repos.getLatestRelease({
+              owner: 'tianocore',
+              repo: 'edk2'
+            });
+            
+            // 获取当前submodule的版本
+            const currentSubmoduleSha = require('child_process').execSync('cd edk2 && git rev-parse HEAD').toString().trim();
+            
+            // 获取最新release对应的commit SHA
+            const latestReleaseSha = await github.rest.repos.getCommit({
+              owner: 'tianocore',
+              repo: 'edk2',
+              ref: latestRelease.tag_name
+            }).then(response => response.data.sha);
+            
+            console.log(`Current submodule SHA: ${currentSubmoduleSha}`);
+            console.log(`Latest release SHA: ${latestReleaseSha}`);
+            console.log(`Latest release tag: ${latestRelease.tag_name}`);
+            
+            // 比较SHA是否相同
+            if (currentSubmoduleSha !== latestReleaseSha) {
+              console.log('New release detected!');
+              core.setOutput('has_new_release', 'true');
+              core.setOutput('latest_tag', latestRelease.tag_name);
+              core.setOutput('latest_sha', latestReleaseSha);
+            } else {
+              console.log('No new release detected.');
+              core.setOutput('has_new_release', 'false');
+            }
+          } catch (error) {
+            console.error('Error checking for releases:', error.message);
+            core.setOutput('has_new_release', 'false');
+          }
+
+  update-submodule:
+    needs: check-release
+    if: needs.check-release.outputs.has_new_release == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+        token: ${{ secrets.GITHUB_TOKEN }}
+        fetch-depth: 0  # 获取所有历史记录，确保标签可用
+
+    - name: Get current year and count existing tags
+      id: tag_info
+      run: |
+        # 获取当前年份的后两位
+        CURRENT_YEAR=$(date +%y)
+        echo "current_year=$CURRENT_YEAR" >> $GITHUB_OUTPUT
+        
+        # 统计今年已有的H标签数量
+        EXISTING_TAGS=$(git tag -l "${CURRENT_YEAR}H*" | wc -l)
+        echo "existing_tags=$EXISTING_TAGS" >> $GITHUB_OUTPUT
+        
+        # 计算新标签号
+        NEW_TAG_NUMBER=$((EXISTING_TAGS + 1))
+        echo "new_tag_number=$NEW_TAG_NUMBER" >> $GITHUB_OUTPUT
+        
+        # 构建完整标签名
+        NEW_TAG="${CURRENT_YEAR}H${NEW_TAG_NUMBER}"
+        echo "new_tag=$NEW_TAG" >> $GITHUB_OUTPUT
+        
+        echo "新标签将是: $NEW_TAG"
+
+    - name: Record release version
+      run: |
+        echo "更新到 EDK2 发布版本: ${{ needs.check-release.outputs.latest_tag }}"
+        echo "发布版本 SHA: ${{ needs.check-release.outputs.latest_sha }}"
+
+    - name: Configure Git
+      run: |
+        git config user.name "github-actions[bot]"
+        git config user.email "github-actions[bot]@users.noreply.github.com"
+
+    - name: Pull latest changes using PAT
+      run: |
+        # 使用 PAT 拉取最新更改，确保本地仓库是最新的
+        git pull https://${{ secrets.PAT_USERNAME }}:${{ secrets.PAT_TOKEN }}@github.com/${{ github.repository }}.git main
+
+    - name: Prepare EDK2 submodule update (without committing)
+      run: |
+        # 进入EDK2 submodule目录
+        cd edk2
+        
+        # 获取所有标签和提交
+        git fetch https://github.com/tianocore/edk2.git --tags --force
+        
+        # 明确切换到release对应的确切commit
+        git checkout ${{ needs.check-release.outputs.latest_sha }} --force
+        
+        # 递归更新所有嵌套的submodule
+        echo "开始递归更新EDK2的嵌套submodule..."
+        git submodule update --init --recursive --force
+        
+        # 返回主仓库目录
+        cd ..
+        
+        echo "EDK2 submodule已准备更新到发布版本 ${{ needs.check-release.outputs.latest_tag }}"
+
+    - name: Verify submodule is at correct commit
+      run: |
+        cd edk2
+        CURRENT_SHA=$(git rev-parse HEAD)
+        EXPECTED_SHA="${{ needs.check-release.outputs.latest_sha }}"
+        if [ "$CURRENT_SHA" != "$EXPECTED_SHA" ]; then
+          echo "错误: Submodule没有在预期的commit上!"
+          echo "当前: $CURRENT_SHA"
+          echo "预期: $EXPECTED_SHA"
+          exit 1
+        else
+          echo "验证成功: Submodule已正确更新到预期commit"
+        fi
+
+    - name: Create and verify tag
+      run: |
+        # 创建标签
+        git tag ${{ steps.tag_info.outputs.new_tag }}
+        
+        # 验证标签是否存在
+        if git show-ref --tags --verify --quiet refs/tags/${{ steps.tag_info.outputs.new_tag }}; then
+          echo "标签 ${{ steps.tag_info.outputs.new_tag }} 创建成功"
+        else
+          echo "错误: 标签 ${{ steps.tag_info.outputs.new_tag }} 创建失败"
+          exit 1
+        fi
+
+    - name: Push changes and tag using PAT
+      run: |
+        # 添加更新后的submodule
+        git add edk2
+        
+        # 提交更新
+        git commit -m "chore: update EDK2 submodule to release ${{ needs.check-release.outputs.latest_tag }}"
+        
+        # 推送更改到主分支
+        git push https://${{ secrets.PAT_USERNAME }}:${{ secrets.PAT_TOKEN }}@github.com/${{ github.repository }}.git main
+        
+        # 推送标签
+        git push https://${{ secrets.PAT_USERNAME }}:${{ secrets.PAT_TOKEN }}@github.com/${{ github.repository }}.git ${{ steps.tag_info.outputs.new_tag }}
+        
+        echo "已使用PAT推送更改和标签"
+
+    - name: Verify remote tag exists
+      run: |
+        # 检查远程标签是否存在
+        if git ls-remote --tags origin | grep -q "refs/tags/${{ steps.tag_info.outputs.new_tag }}"; then
+          echo "标签 ${{ steps.tag_info.outputs.new_tag }} 已成功推送到远程仓库"
+        else
+          echo "错误: 标签 ${{ steps.tag_info.outputs.new_tag }} 未在远程仓库中找到"
+          exit 1
+        fi
+
+    - name: Create GitHub Release
+      uses: softprops/action-gh-release@v1
+      with:
+        tag_name: ${{ steps.tag_info.outputs.new_tag }}
+        name: ${{ steps.tag_info.outputs.new_tag }}
+        body: |
+          ## 更新内容
+          
+          此版本更新了 EDK2 submodule 到上游发布版本 [${{ needs.check-release.outputs.latest_tag }}](https://github.com/tianocore/edk2/releases/tag/${{ needs.check-release.outputs.latest_tag }})
+          
+          ### EDK2 更新详情
+          - **版本**: ${{ needs.check-release.outputs.latest_tag }}
+          - **Commit SHA**: ${{ needs.check-release.outputs.latest_sha }}
+          - **更新日期**: $(date +'%Y-%m-%d')
+          
+          ### 自动生成信息
+          此 Release 由 GitHub Actions 自动创建，基于上游 EDK2 的新发布版本。
+        draft: false
+        prerelease: false
+        generate_release_notes: true
+
+    - name: Trigger downstream workflow via repository_dispatch
+      uses: peter-evans/repository-dispatch@v2
+      with:
+        token: ${{ secrets.PAT_TOKEN }}
+        repository: ${{ github.repository }}  # 使用当前仓库
+        event-type: trigger_compile
+        client-payload: '{"tag": "${{ steps.tag_info.outputs.new_tag }}"}'
+
+    - name: Notify on update
+      run: |
+        echo "EDK2 submodule及其所有嵌套submodule已更新到发布版本 ${{ needs.check-release.outputs.latest_tag }}"
+        echo "已创建标签 ${{ steps.tag_info.outputs.new_tag }} 并发布 Release"
+        echo "已触发下游编译 Workflow"
+
+  # 添加一个简单的成功通知作业
+  notify-success:
+    needs: update-submodule
+    if: success()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Notify complete success
+        run: |
+          echo "所有操作已成功完成!"
+          echo "EDK2 已更新到: ${{ needs.check-release.outputs.latest_tag }}"
+          echo "新标签: ${{ needs.update-submodule.outputs.new_tag }}"
